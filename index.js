@@ -1,225 +1,160 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
-const { chromium } = require('playwright');
 require('dotenv').config();
 
 var bancache = {};
 var unbancache = {};
 
-// Browser instance that will be reused
-let browser = null;
-let browserContext = null;
-
-// Initialize browser
-async function initBrowser() {
-    if (!browser) {
-        browser = await chromium.launch({
-            headless: true, // Set to false for debugging
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--ignore-certificate-errors',
-                '--ignore-certificate-errors-spki-list'
-            ]
-        });
-        
-        browserContext = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1920, height: 1080 },
-            locale: 'en-US',
-            timezoneId: 'America/New_York',
-            ignoreHTTPSErrors: true, // Ignore SSL errors
-            bypassCSP: true // Bypass Content Security Policy
-        });
-        
-        console.log('Browser initialized successfully');
-    }
-    return browserContext;
-}
-
-// Improved check function using Playwright
+// Improved check function using Instagram's public API
 async function check(username) {
-    let page = null;
     try {
-        const context = await initBrowser();
-        page = await context.newPage();
+        console.log(`\n=== Checking: @${username} ===`);
         
-        // Set extra headers to appear more human-like
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        // Method 1: Try to fetch user info from Instagram's public endpoint
+        const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${username}`;
+        
+        const response = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'X-IG-App-ID': '936619743392459',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin'
+            }
         });
-        
-        const url = `https://www.instagram.com/${username}/`;
-        console.log(`\n=== Checking: ${url} ===`);
-        
-        // Navigate to the profile with more lenient settings
-        let response;
-        try {
-            response = await page.goto(url, { 
-                waitUntil: 'domcontentloaded', // Changed from networkidle to be more lenient
-                timeout: 30000 
-            });
-        } catch (gotoError) {
-            // If goto fails, try to still analyze the page
-            console.log(`⚠️ Navigation warning: ${gotoError.message}`);
-            // Continue anyway, the page might have loaded partially
-        }
-        
-        // Wait a bit more for dynamic content to load
-        await page.waitForTimeout(3000);
-        
-        // Check if we're on login page
-        const currentUrl = page.url();
-        console.log(`Current URL: ${currentUrl}`);
-        
-        if (currentUrl.includes('/accounts/login')) {
-            console.log(`❌ Redirected to login for ${username}`);
-            await page.close();
-            return 'BLOCKED';
-        }
-        
-        // Get page title for debugging
-        const pageTitle = await page.title();
-        console.log(`Page title: ${pageTitle}`);
-        
-        // Method 1: Check for "Sorry, this page isn't available" message
-        const pageNotAvailableText = await page.locator('text=/Sorry, this page isn.*t available/i').count();
-        const userNotFoundText = await page.locator('text=/The link you followed may be broken/i').count();
-        
-        if (pageNotAvailableText > 0 || userNotFoundText > 0) {
-            console.log(`❌ Account ${username} is not available (banned or doesn't exist)`);
-            await page.close();
+
+        console.log(`Response status: ${response.status}`);
+
+        // Check status codes
+        if (response.status === 404) {
+            console.log(`❌ Account not found or banned`);
             return 'BANNED';
         }
-        
-        // Method 2: Try to find follower count from meta tags
-        const metaContent = await page.locator('meta[property="og:description"]').getAttribute('content').catch(() => null);
-        if (metaContent) {
-            console.log(`✅ Meta description found: ${metaContent}`);
-            
-            // Extract follower count
-            const followerMatch = metaContent.match(/(\d+[\d,]*)\s+Followers?/i);
-            if (followerMatch) {
-                const followers = followerMatch[1].replace(/,/g, '');
-                console.log(`✅ Found ${followers} followers for ${username}`);
-                await page.close();
-                return followers;
-            }
-            
-            // Check if meta contains post/following info (means account is active)
-            if (metaContent.match(/\d+\s+(Posts?|Following|Followers?)/i)) {
-                console.log(`✅ Account appears active from meta`);
-                await page.close();
-                return 'ACTIVE';
-            }
+
+        if (response.status === 429) {
+            console.log(`⚠️ Rate limited`);
+            return 'BLOCKED';
         }
-        
-        // Method 3: Look for profile picture (strong indicator account exists)
-        const profilePicExists = await page.locator('img[alt*="profile picture"]').count();
-        if (profilePicExists > 0) {
-            console.log(`✅ Profile picture found - account is active`);
-            await page.close();
-            return 'ACTIVE';
+
+        if (!response.ok) {
+            console.log(`⚠️ Unexpected status: ${response.status}`);
+            // Fallback to scraping method
+            return await checkFallback(username);
         }
-        
-        // Method 4: Try to find follower count from page elements
-        try {
-            await page.waitForSelector('header', { timeout: 5000 });
-            
-            // Look for any span/link that contains follower info
-            const statsElements = await page.locator('ul li span').allTextContents();
-            console.log(`Stats elements found: ${JSON.stringify(statsElements)}`);
-            
-            for (const stat of statsElements) {
-                const followerMatch = stat.match(/(\d+[\d,KkMm]*)/);
-                if (followerMatch && stat.toLowerCase().includes('follower')) {
-                    console.log(`✅ Found follower stat: ${followerMatch[1]}`);
-                    await page.close();
-                    return followerMatch[1].replace(/,/g, '');
-                }
-            }
-            
-            // If we found header but no stats, account still exists
-            if (statsElements.length > 0) {
-                console.log(`✅ Account exists (header found)`);
-                await page.close();
-                return 'ACTIVE';
-            }
-        } catch (e) {
-            console.log(`⚠️ Could not find header/stats: ${e.message}`);
+
+        const data = await response.json();
+
+        if (data.data && data.data.user) {
+            const user = data.data.user;
+            const followers = user.edge_followed_by?.count || 0;
+            console.log(`✅ Account active - ${followers} followers`);
+            return followers.toString();
+        } else {
+            console.log(`⚠️ No user data found`);
+            return 'BANNED';
         }
-        
-        // Method 5: Check page content for any signs of a valid profile
-        const bodyText = await page.locator('body').textContent();
-        
-        // If page contains profile-specific elements
-        if (bodyText.includes('posts') || bodyText.includes('followers') || bodyText.includes('following')) {
-            console.log(`✅ Account appears valid (contains profile keywords)`);
-            await page.close();
-            return 'ACTIVE';
-        }
-        
-        // Method 6: Check if response was successful (if we got a response)
-        if (response) {
-            console.log(`Response status: ${response.status()}`);
-            if (response.ok() && response.status() === 200) {
-                console.log(`✅ Page loaded successfully (200 OK) - account likely exists`);
-                await page.close();
-                return 'ACTIVE';
-            }
-            // Handle specific status codes
-            if (response.status() === 404) {
-                console.log(`❌ 404 Not Found - account doesn't exist or is banned`);
-                await page.close();
-                return 'BANNED';
-            }
-        }
-        
-        console.log(`⚠️ Could not determine account status definitively`);
-        await page.close();
-        return 'UNKNOWN';
-        
+
     } catch (error) {
         console.error(`❌ Error checking ${username}:`, error.message);
-        if (page) {
-            try {
-                // Try to check if page loaded despite error
-                const currentUrl = await page.url().catch(() => null);
-                if (currentUrl && !currentUrl.includes('/accounts/login')) {
-                    console.log(`⚠️ Error occurred but page might have loaded, attempting to analyze...`);
-                    
-                    // Try to check for error message
-                    const pageNotAvailable = await page.locator('text=/Sorry, this page isn.*t available/i').count().catch(() => 0);
-                    if (pageNotAvailable > 0) {
-                        console.log(`❌ Account is banned despite navigation error`);
-                        await page.close();
-                        return 'BANNED';
-                    }
-                    
-                    // Try to find any sign of account
-                    const bodyText = await page.locator('body').textContent().catch(() => '');
-                    if (bodyText.includes('followers') || bodyText.includes('posts')) {
-                        console.log(`✅ Account appears active despite navigation error`);
-                        await page.close();
-                        return 'ACTIVE';
-                    }
-                }
-            } catch (analysisError) {
-                console.log(`Could not analyze page after error: ${analysisError.message}`);
+        // Try fallback method
+        return await checkFallback(username);
+    }
+}
+
+// Fallback method using simple HTML scraping
+async function checkFallback(username) {
+    try {
+        console.log(`Trying fallback method for ${username}...`);
+        
+        const response = await fetch(`https://www.instagram.com/${username}/`, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
+            redirect: 'manual'
+        });
+
+        // Check for redirects to login
+        if (response.status === 301 || response.status === 302) {
+            const location = response.headers.get('location');
+            if (location && location.includes('/accounts/login')) {
+                console.log(`⚠️ Redirected to login - may be blocked`);
+                return 'BLOCKED';
             }
-            await page.close().catch(() => {});
         }
+
+        if (response.status === 404) {
+            console.log(`❌ 404 - Account banned or doesn't exist`);
+            return 'BANNED';
+        }
+
+        if (!response.ok) {
+            console.log(`⚠️ Status ${response.status}`);
+            return 'ERROR';
+        }
+
+        const html = await response.text();
+
+        // Check for banned/error page
+        if (html.includes('Sorry, this page isn\'t available') || 
+            html.includes('The link you followed may be broken')) {
+            console.log(`❌ Account banned or doesn't exist`);
+            return 'BANNED';
+        }
+
+        // Check for login requirement
+        if (html.includes('Login • Instagram') || html.includes('"require_login":true')) {
+            console.log(`⚠️ Login required - blocked`);
+            return 'BLOCKED';
+        }
+
+        // Try to extract follower count from meta tags
+        const metaMatch = html.match(/<meta property="og:description" content="([^"]+)"/);
+        if (metaMatch) {
+            const description = metaMatch[1];
+            const followerMatch = description.match(/(\d+[\d,KkMm]*)\s+Followers?/i);
+            if (followerMatch) {
+                const followers = followerMatch[1].replace(/,/g, '');
+                console.log(`✅ Found ${followers} followers`);
+                return followers;
+            }
+        }
+
+        // Try to extract from JSON data
+        const jsonMatch = html.match(/<script type="application\/ld\+json">({[^<]+})<\/script>/);
+        if (jsonMatch) {
+            try {
+                const jsonData = JSON.parse(jsonMatch[1]);
+                if (jsonData.mainEntityofPage) {
+                    console.log(`✅ Account appears active`);
+                    return 'ACTIVE';
+                }
+            } catch (e) {
+                // JSON parsing failed
+            }
+        }
+
+        // If page loaded and has profile keywords, consider it active
+        if (html.includes('"is_private"') || html.includes('"edge_followed_by"')) {
+            console.log(`✅ Account appears active (profile data found)`);
+            return 'ACTIVE';
+        }
+
+        console.log(`⚠️ Could not determine status`);
+        return 'UNKNOWN';
+
+    } catch (error) {
+        console.error(`Fallback error: ${error.message}`);
         return 'ERROR';
     }
 }
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
-const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 180000; // Increased to 3 minutes
+const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 120000; // 2 minutes default
 
 let watchedAccounts = {}; 
 let storedFollowerData = {};  
@@ -239,9 +174,8 @@ const client = new Client({
 
 client.once('clientReady', async () => {
     console.log(`We have logged in as ${client.user.tag}`);
-    console.log('Initializing browser...');
-    await initBrowser();
     console.log('Bot is ready to monitor Instagram accounts!');
+    console.log(`Check interval: ${CHECK_INTERVAL/1000} seconds`);
 });
 
 function formatTimestamp(date) {
@@ -253,8 +187,7 @@ function isBanned(info) {
 }
 
 function isActive(info) {
-    // Consider ACTIVE, UNKNOWN, and any follower count as "active"
-    return info !== 'BANNED' && info !== 'N/A' && info !== 'ERROR' && info !== 'BLOCKED' && info !== null;
+    return info !== 'BANNED' && info !== 'N/A' && info !== 'ERROR' && info !== 'BLOCKED' && info !== null && info !== 'UNKNOWN';
 }
 
 client.on('messageCreate', async (message) => {
@@ -331,7 +264,6 @@ client.on('messageCreate', async (message) => {
         const username = args[1].replace('@', '');
         const startTime = new Date();
 
-        // Show loading message
         const loadingEmbed = new EmbedBuilder()
             .setTitle('🔍 Checking Account Status...')
             .setDescription(`Checking **@${username}**...`)
@@ -345,7 +277,7 @@ client.on('messageCreate', async (message) => {
         if (info === 'BLOCKED') {
             const embed = new EmbedBuilder()
                 .setTitle('⚠️ Request Blocked')
-                .setDescription(`Instagram is blocking automated requests. Try again in a few minutes.`)
+                .setDescription(`Instagram is blocking requests. Try again in a few minutes.`)
                 .setColor(0xFFA500)
                 .setFooter({ text: 'Rate limited', iconURL: client.user.displayAvatarURL() });
 
@@ -385,7 +317,7 @@ client.on('messageCreate', async (message) => {
                     if (isActive(infoa) && !hasSentEmbed) {
                         const embed = new EmbedBuilder()
                             .setTitle(`Account has been reactivated Successfully! | ${username} ✅`)
-                            .setDescription(`Time Taken: ${timeDifferenceMinutes} minutes\nStatus: ${infoa}`)
+                            .setDescription(`Time Taken: ${timeDifferenceMinutes} minutes\nFollowers: ${infoa}`)
                             .setColor(0x00FF00)
                             .setFooter({ text: 'Monitor Bot v1', iconURL: client.user.displayAvatarURL() });
 
@@ -407,7 +339,7 @@ client.on('messageCreate', async (message) => {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: `Requested by @${message.author.username} ${formatTimestamp(startTime)}` })
                 .setTitle('❌ Invalid for Unban Watch')
-                .setDescription(`The Instagram account **@${username}** is not banned and cannot be watched for reactivation.\n\nCurrent status: ${info}`)
+                .setDescription(`The Instagram account **@${username}** is not banned.\n\nCurrent status: ${info} followers`)
                 .setColor(0xFF0000)
                 .setThumbnail(message.author.displayAvatarURL())
                 .setFooter({ text: 'Please try again', iconURL: client.user.displayAvatarURL() });
@@ -432,7 +364,6 @@ client.on('messageCreate', async (message) => {
         const username = args[1].replace('@', '');
         const startTime = new Date();
 
-        // Show loading message
         const loadingEmbed = new EmbedBuilder()
             .setTitle('🔍 Checking Account Status...')
             .setDescription(`Checking **@${username}**...`)
@@ -446,7 +377,7 @@ client.on('messageCreate', async (message) => {
         if (info === 'BLOCKED') {
             const embed = new EmbedBuilder()
                 .setTitle('⚠️ Request Blocked')
-                .setDescription(`Instagram is blocking automated requests. Try again in a few minutes.`)
+                .setDescription(`Instagram is blocking requests. Try again in a few minutes.`)
                 .setColor(0xFFA500)
                 .setFooter({ text: 'Rate limited', iconURL: client.user.displayAvatarURL() });
 
@@ -458,7 +389,7 @@ client.on('messageCreate', async (message) => {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: `Requested by @${message.author.username} ${formatTimestamp(startTime)}` })
                 .setTitle('👀 Monitoring Initiated')
-                .setDescription(`The Instagram account **@${username}** is currently valid. Monitoring for any bans...\n\nCurrent info: ${info}`)
+                .setDescription(`The Instagram account **@${username}** is currently valid. Monitoring for any bans...\n\nCurrent followers: ${info}`)
                 .setColor(0x000000)
                 .setThumbnail(message.author.displayAvatarURL())
                 .setFooter({ text: 'Monitoring in progress', iconURL: client.user.displayAvatarURL() })
@@ -501,7 +432,7 @@ client.on('messageCreate', async (message) => {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: `Requested by @${message.author.username} ${formatTimestamp(startTime)}` })
                 .setTitle('❌ Invalid for Ban Watch')
-                .setDescription(`The Instagram account **@${username}** is already banned or unavailable and cannot be watched for bans.\n\nStatus: ${info}`)
+                .setDescription(`The Instagram account **@${username}** is already banned or unavailable.\n\nStatus: ${info}`)
                 .setColor(0xFF0000)
                 .setThumbnail(message.author.displayAvatarURL())
                 .setFooter({ text: 'Please try again', iconURL: client.user.displayAvatarURL() });
@@ -539,12 +470,15 @@ client.on('messageCreate', async (message) => {
         } else if (info === 'ERROR') {
             statusColor = 0xFF0000;
             statusText = 'Error Occurred';
-        } else if (info === 'ACTIVE' || info === 'UNKNOWN') {
+        } else if (info === 'ACTIVE') {
             statusColor = 0x00FF00;
-            statusText = info === 'UNKNOWN' ? 'Active (Status Uncertain)' : 'Active (No follower count available)';
+            statusText = 'Active (follower count unavailable)';
+        } else if (info === 'UNKNOWN') {
+            statusColor = 0xFFA500;
+            statusText = 'Status Unknown';
         } else if (!isNaN(info)) {
             statusColor = 0x00FF00;
-            statusText = `Active - ${info} followers`;
+            statusText = `Active - ${parseInt(info).toLocaleString()} followers`;
         }
         
         const embed = new EmbedBuilder()
@@ -602,7 +536,7 @@ client.on('messageCreate', async (message) => {
             **!giveaccess <user id>** - Grants access to a user by adding them to the allowed list.
             **!help** - Displays this help message.
             
-            **Note:** Using Playwright for better reliability. Check interval is 3 minutes.
+            **Note:** Using Instagram's API for fast, reliable checks. Default check interval is 2 minutes.
             `)
             .setColor(0x000000)
             .setThumbnail('https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExOWtxcTZpa2gyMHE1cDFteWNod2Jjbmt0bmJjamNoYXo3MHB1Mjd0ZiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/OUy615BJPyrkAxkwTh/giphy.gif')
@@ -610,23 +544,6 @@ client.on('messageCreate', async (message) => {
 
         await message.channel.send({ embeds: [embed] });
     }
-});
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('Shutting down gracefully...');
-    if (browser) {
-        await browser.close();
-    }
-    process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-    console.log('Shutting down gracefully...');
-    if (browser) {
-        await browser.close();
-    }
-    process.exit(0);
 });
 
 client.login(TOKEN);
