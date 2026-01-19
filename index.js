@@ -48,101 +48,121 @@ async function check(username) {
         });
         
         const url = `https://www.instagram.com/${username}/`;
-        console.log(`Checking: ${url}`);
+        console.log(`\n=== Checking: ${url} ===`);
         
         // Navigate to the profile with timeout
         const response = await page.goto(url, { 
-            waitUntil: 'domcontentloaded',
+            waitUntil: 'networkidle',
             timeout: 30000 
         });
         
-        // Wait a bit for dynamic content to load
-        await page.waitForTimeout(2000);
+        // Wait a bit more for dynamic content to load
+        await page.waitForTimeout(3000);
         
         // Check if we're on login page
         const currentUrl = page.url();
+        console.log(`Current URL: ${currentUrl}`);
+        
         if (currentUrl.includes('/accounts/login')) {
-            console.log(`Redirected to login for ${username}`);
+            console.log(`❌ Redirected to login for ${username}`);
             await page.close();
             return 'BLOCKED';
         }
         
-        // Get page content
-        const content = await page.content();
+        // Get page title for debugging
+        const pageTitle = await page.title();
+        console.log(`Page title: ${pageTitle}`);
         
         // Method 1: Check for "Sorry, this page isn't available" message
-        const pageNotAvailable = await page.locator('text=Sorry, this page isn\'t available').count();
-        if (pageNotAvailable > 0) {
-            console.log(`Account ${username} is not available (banned or doesn't exist)`);
+        const pageNotAvailableText = await page.locator('text=/Sorry, this page isn.*t available/i').count();
+        const userNotFoundText = await page.locator('text=/The link you followed may be broken/i').count();
+        
+        if (pageNotAvailableText > 0 || userNotFoundText > 0) {
+            console.log(`❌ Account ${username} is not available (banned or doesn't exist)`);
             await page.close();
-            return 'N/A';
+            return 'BANNED';
         }
         
         // Method 2: Try to find follower count from meta tags
-        const metaContent = await page.locator('meta[property="og:description"]').getAttribute('content');
+        const metaContent = await page.locator('meta[property="og:description"]').getAttribute('content').catch(() => null);
         if (metaContent) {
-            console.log(`Meta description: ${metaContent}`);
+            console.log(`✅ Meta description found: ${metaContent}`);
             
             // Extract follower count
             const followerMatch = metaContent.match(/(\d+[\d,]*)\s+Followers?/i);
             if (followerMatch) {
                 const followers = followerMatch[1].replace(/,/g, '');
-                console.log(`Found ${followers} followers for ${username}`);
+                console.log(`✅ Found ${followers} followers for ${username}`);
                 await page.close();
                 return followers;
             }
             
-            // If no followers found, try to extract first part before dash
-            const parts = metaContent.split('-');
-            if (parts.length > 0) {
+            // Check if meta contains post/following info (means account is active)
+            if (metaContent.match(/\d+\s+(Posts?|Following|Followers?)/i)) {
+                console.log(`✅ Account appears active from meta`);
                 await page.close();
-                return parts[0].trim();
+                return 'ACTIVE';
             }
         }
         
-        // Method 3: Try to find follower count from page elements
-        try {
-            // Wait for profile data to load
-            await page.waitForSelector('header', { timeout: 5000 });
-            
-            // Try to find follower text
-            const followerElement = await page.locator('a[href*="/followers/"] span').first().textContent();
-            if (followerElement) {
-                console.log(`Found follower count from element: ${followerElement}`);
-                await page.close();
-                return followerElement.replace(/,/g, '');
-            }
-        } catch (e) {
-            console.log(`Could not find follower element: ${e.message}`);
-        }
-        
-        // Method 4: Check JSON-LD data
-        const jsonLdScript = await page.locator('script[type="application/ld+json"]').first().textContent().catch(() => null);
-        if (jsonLdScript) {
-            try {
-                const data = JSON.parse(jsonLdScript);
-                if (data && data.mainEntityofPage) {
-                    console.log(`Account ${username} is active (from JSON-LD)`);
-                    await page.close();
-                    return 'ACTIVE';
-                }
-            } catch (e) {
-                // JSON parsing failed
-            }
-        }
-        
-        // If we got here and the page loaded successfully, account likely exists
-        if (response && response.ok()) {
-            console.log(`Account ${username} appears to be active`);
+        // Method 3: Look for profile picture (strong indicator account exists)
+        const profilePicExists = await page.locator('img[alt*="profile picture"]').count();
+        if (profilePicExists > 0) {
+            console.log(`✅ Profile picture found - account is active`);
             await page.close();
             return 'ACTIVE';
         }
         
+        // Method 4: Try to find follower count from page elements
+        try {
+            await page.waitForSelector('header', { timeout: 5000 });
+            
+            // Look for any span/link that contains follower info
+            const statsElements = await page.locator('ul li span').allTextContents();
+            console.log(`Stats elements found: ${JSON.stringify(statsElements)}`);
+            
+            for (const stat of statsElements) {
+                const followerMatch = stat.match(/(\d+[\d,KkMm]*)/);
+                if (followerMatch && stat.toLowerCase().includes('follower')) {
+                    console.log(`✅ Found follower stat: ${followerMatch[1]}`);
+                    await page.close();
+                    return followerMatch[1].replace(/,/g, '');
+                }
+            }
+            
+            // If we found header but no stats, account still exists
+            if (statsElements.length > 0) {
+                console.log(`✅ Account exists (header found)`);
+                await page.close();
+                return 'ACTIVE';
+            }
+        } catch (e) {
+            console.log(`⚠️ Could not find header/stats: ${e.message}`);
+        }
+        
+        // Method 5: Check page content for any signs of a valid profile
+        const bodyText = await page.locator('body').textContent();
+        
+        // If page contains profile-specific elements
+        if (bodyText.includes('posts') || bodyText.includes('followers') || bodyText.includes('following')) {
+            console.log(`✅ Account appears valid (contains profile keywords)`);
+            await page.close();
+            return 'ACTIVE';
+        }
+        
+        // Method 6: Check if response was successful
+        if (response && response.ok() && response.status() === 200) {
+            console.log(`✅ Page loaded successfully (200 OK) - account likely exists`);
+            await page.close();
+            return 'ACTIVE';
+        }
+        
+        console.log(`⚠️ Could not determine account status definitively`);
         await page.close();
-        return 'N/A';
+        return 'UNKNOWN';
         
     } catch (error) {
-        console.error(`Error checking ${username}:`, error.message);
+        console.error(`❌ Error checking ${username}:`, error.message);
         if (page) await page.close().catch(() => {});
         return 'ERROR';
     }
@@ -180,11 +200,12 @@ function formatTimestamp(date) {
 }
 
 function isBanned(info) {
-    return info === 'N/A' || (typeof info === 'string' && info.length <= 3 && info !== 'N/A');
+    return info === 'BANNED' || info === 'N/A';
 }
 
 function isActive(info) {
-    return info !== 'N/A' && info !== 'ERROR' && info !== 'BLOCKED' && info !== null;
+    // Consider ACTIVE, UNKNOWN, and any follower count as "active"
+    return info !== 'BANNED' && info !== 'N/A' && info !== 'ERROR' && info !== 'BLOCKED' && info !== null;
 }
 
 client.on('messageCreate', async (message) => {
@@ -460,7 +481,7 @@ client.on('messageCreate', async (message) => {
         let statusColor = 0x0099FF;
         let statusText = info;
         
-        if (info === 'N/A') {
+        if (info === 'BANNED' || info === 'N/A') {
             statusColor = 0xFF0000;
             statusText = 'Banned or Not Found';
         } else if (info === 'BLOCKED') {
@@ -469,9 +490,9 @@ client.on('messageCreate', async (message) => {
         } else if (info === 'ERROR') {
             statusColor = 0xFF0000;
             statusText = 'Error Occurred';
-        } else if (info === 'ACTIVE') {
+        } else if (info === 'ACTIVE' || info === 'UNKNOWN') {
             statusColor = 0x00FF00;
-            statusText = 'Active (No follower count available)';
+            statusText = info === 'UNKNOWN' ? 'Active (Status Uncertain)' : 'Active (No follower count available)';
         } else if (!isNaN(info)) {
             statusColor = 0x00FF00;
             statusText = `Active - ${info} followers`;
