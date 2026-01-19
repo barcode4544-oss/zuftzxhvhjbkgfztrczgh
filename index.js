@@ -4,32 +4,83 @@ require('dotenv').config();
 var bancache = {};
 var unbancache = {};
 
+// Improved check function with better error handling and rate limiting
 async function check(username) {
-    const req = await fetch("https://instagram.com/"+username+'/', {
-        "credentials": "omit",
-        "headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Sec-GPC": "1",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Priority": "u=4"
-        },
-        "method": "GET",
-        "mode": "cors"
-    });
-    const res = await req.text();
-    console.log(req)
-    const sp =res.split('<meta property="og:description" content="');
-    console.log(sp.length);
-    if (sp.length>1) {
-        return sp[1].split('-')[0];
-    } else {
-        return 'N/A'
+    try {
+        // Add random delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, Math.random() * 2000 + 1000));
+        
+        const req = await fetch(`https://www.instagram.com/${username}/`, {
+            "headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Cache-Control": "max-age=0",
+                "DNT": "1"
+            },
+            "method": "GET",
+            "redirect": "manual" // Don't follow redirects
+        });
+
+        // Check if we got redirected to login (status 301/302)
+        if (req.status === 301 || req.status === 302) {
+            console.log(`Redirected - Instagram may be blocking requests for ${username}`);
+            return 'BLOCKED'; // Return special status
+        }
+
+        if (req.status !== 200) {
+            console.log(`Status ${req.status} for ${username}`);
+            return 'ERROR';
+        }
+
+        const res = await req.text();
+        
+        // Check if we're on the login page
+        if (res.includes('Login • Instagram') || res.includes('accounts/login')) {
+            console.log(`Login page detected for ${username} - requests are being blocked`);
+            return 'BLOCKED';
+        }
+
+        // Multiple ways to check account status
+        // Method 1: Check for specific error messages
+        if (res.includes('Sorry, this page') || res.includes('isn\'t available')) {
+            return 'N/A'; // Banned or doesn't exist
+        }
+
+        // Method 2: Try to find follower data
+        const sp = res.split('<meta property="og:description" content="');
+        if (sp.length > 1) {
+            const description = sp[1].split('"')[0];
+            const followerMatch = description.match(/(\d+[\d,]*)\s+Followers?/i);
+            if (followerMatch) {
+                return followerMatch[1].replace(/,/g, '');
+            }
+            return description.split('-')[0].trim();
+        }
+
+        // Method 3: Check JSON data in page
+        const jsonMatch = res.match(/<script type="application\/ld\+json">(.*?)<\/script>/s);
+        if (jsonMatch) {
+            try {
+                const data = JSON.parse(jsonMatch[1]);
+                if (data && data.mainEntityofPage) {
+                    return 'ACTIVE'; // Account exists and is accessible
+                }
+            } catch (e) {
+                // JSON parsing failed, continue
+            }
+        }
+
+        return 'N/A';
+    } catch (error) {
+        console.error(`Error checking ${username}:`, error.message);
+        return 'ERROR';
     }
 }
 
@@ -53,61 +104,23 @@ const client = new Client({
     ],
 });
 
-client.once('ready', () => {
+// Fix the deprecation warning
+client.once('clientReady', () => {
     console.log(`We have logged in as ${client.user.tag}`);
+    console.log('Bot is ready to monitor Instagram accounts!');
 });
 
 function formatTimestamp(date) {
     return `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
 }
 
-async function monitorAccount(message, username, url, expectedStatus, startTime, watchType) {
-    while (watchedAccounts[username]) {
-        try {
-            const info = await check(username);
-            console.log(`Monitoring ${username}`);
-            const currentTime = Date.now()
-            const timeDifference = Math.abs(currentTime - startTime) / 1000;
-            const timeDifferenceMinutes = Math.floor(timeDifference / 60);
-
-            if (expectedStatus === 'valid' && info.length == 3) {
-                const embed = new EmbedBuilder()
-                    .setTitle(`Account Has Been Smoked! | ${username} ✅`)
-                    .setDescription(`**Time Taken:** ${timeDifferenceMinutes} minutes\n${info}`)
-                    .setColor(0x000000)
-                    .setFooter({ text: 'Monitor Bot v1', iconURL: client.user.displayAvatarURL() });
-
-                await message.channel.send({ embeds: [embed] });
-                delete watchedAccounts[username];
-                const index = banWatchList.indexOf(username);
-                if (index > -1) {
-                    banWatchList.splice(index, 1);
-                }
-                break;
-            } else if (watchType === 'unbanwatch' && expectedStatus === 'valid' && info.length > 3) {
-                const embed = new EmbedBuilder()
-                    .setTitle(`Account has been reactivated Successfully! | ${username} ✅`)
-                    .setDescription(`**Time Taken:** ${timeDifferenceMinutes} minutes`+info)
-                    .setColor(0x000000)
-                    .setFooter({ text: 'Monitor Bot v1', iconURL: client.user.displayAvatarURL() });
-
-                await message.channel.send({ embeds: [embed] });
-                delete watchedAccounts[username];
-                const indexUnban = unbanWatchList.indexOf(username);
-                if (indexUnban > -1) {
-                    unbanWatchList.splice(indexUnban, 1);
-                }
-                break;
-            }
-        } catch (error) {
-            console.error(`Error during monitoring for ${username}:`, error);
-            sendErrorDM(message.author.id, error.message);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL));
-    }
+function isBanned(info) {
+    return info === 'N/A' || (typeof info === 'string' && info.length <= 3);
 }
 
+function isActive(info) {
+    return info !== 'N/A' && info !== 'ERROR' && info !== 'BLOCKED' && info !== null;
+}
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
@@ -180,13 +193,23 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        const username = args[1];
-        const url = `https://www.instagram.com/${username}/?hl=en`;
+        const username = args[1].replace('@', ''); // Remove @ if present
         const startTime = new Date();
 
         const info = await check(username);
 
-        if (info.length == 3) {
+        if (info === 'BLOCKED') {
+            const embed = new EmbedBuilder()
+                .setTitle('⚠️ Request Blocked')
+                .setDescription(`Instagram is blocking automated requests. The bot may need to use proxies or reduce request frequency.`)
+                .setColor(0xFFA500)
+                .setFooter({ text: 'Try again later', iconURL: client.user.displayAvatarURL() });
+
+            await message.channel.send({ embeds: [embed] });
+            return;
+        }
+
+        if (isBanned(info)) {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: `Requested by @${message.author.username} ${formatTimestamp(startTime)}` })
                 .setTitle('👀 Account Banned')
@@ -201,7 +224,7 @@ client.on('messageCreate', async (message) => {
             watchedAccounts[username] = true;
             unbanWatchList.push(username);
 
-            let hasSentEmbed = false;  
+            let hasSentEmbed = false;
 
             const intv = setInterval(async function() {
                 try {
@@ -210,17 +233,23 @@ client.on('messageCreate', async (message) => {
                     const timeDifference = Math.abs(currentTime - startTime) / 1000;
                     const timeDifferenceMinutes = Math.floor(timeDifference / 60);
 
-                    if (infoa.length > 3 && !hasSentEmbed) {
-            const embed = new EmbedBuilder()
-                .setTitle(`Account has been reactivated Successfully! | ${username} ✅`)
-                .setDescription(` Time Taken: ${timeDifferenceMinutes} minutes ` + infoa)
-                .setColor(0x000000)
-                .setFooter({ text: 'Monitor Bot v1', iconURL: client.user.displayAvatarURL() });
+                    if (infoa === 'BLOCKED') {
+                        console.log(`Monitoring ${username} - requests blocked, will retry...`);
+                        return;
+                    }
+
+                    if (isActive(infoa) && !hasSentEmbed) {
+                        const embed = new EmbedBuilder()
+                            .setTitle(`Account has been reactivated Successfully! | ${username} ✅`)
+                            .setDescription(`Time Taken: ${timeDifferenceMinutes} minutes\nStatus: ${infoa}`)
+                            .setColor(0x00FF00)
+                            .setFooter({ text: 'Monitor Bot v1', iconURL: client.user.displayAvatarURL() });
 
                         await message.channel.send({ embeds: [embed] });
-                        hasSentEmbed = true;  
+                        hasSentEmbed = true;
                         clearInterval(intv);
 
+                        delete watchedAccounts[username];
                         const indexUnban = unbanWatchList.indexOf(username);
                         if (indexUnban > -1) {
                             unbanWatchList.splice(indexUnban, 1);
@@ -228,14 +257,13 @@ client.on('messageCreate', async (message) => {
                     }
                 } catch (error) {
                     console.error(`Error during monitoring for ${username}:`, error);
-                    sendErrorDM(message.author.id, error.message);
                 }
             }, CHECK_INTERVAL);
         } else {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: `Requested by @${message.author.username} ${formatTimestamp(startTime)}` })
                 .setTitle('❌ Invalid for Unban Watch')
-                .setDescription(`The Instagram account **@${username}** is not banned and cannot be watched for reactivation.`)
+                .setDescription(`The Instagram account **@${username}** is not banned and cannot be watched for reactivation.\n\nCurrent status: ${info}`)
                 .setColor(0xFF0000)
                 .setThumbnail(message.author.displayAvatarURL())
                 .setFooter({ text: 'Please try again', iconURL: client.user.displayAvatarURL() });
@@ -257,17 +285,27 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        const username = args[1];
-        const url = `https://instagram.com/${username}`;
+        const username = args[1].replace('@', '');
         const startTime = new Date();
 
-        const info = await check(username)
+        const info = await check(username);
 
-        if (info.length != 3) {
+        if (info === 'BLOCKED') {
+            const embed = new EmbedBuilder()
+                .setTitle('⚠️ Request Blocked')
+                .setDescription(`Instagram is blocking automated requests. The bot may need to use proxies or reduce request frequency.`)
+                .setColor(0xFFA500)
+                .setFooter({ text: 'Try again later', iconURL: client.user.displayAvatarURL() });
+
+            await message.channel.send({ embeds: [embed] });
+            return;
+        }
+
+        if (isActive(info)) {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: `Requested by @${message.author.username} ${formatTimestamp(startTime)}` })
                 .setTitle('👀 Monitoring Initiated')
-                .setDescription(`The Instagram account **@${username}** is currently valid. Monitoring for any bans...`)
+                .setDescription(`The Instagram account **@${username}** is currently valid. Monitoring for any bans...\n\nCurrent info: ${info}`)
                 .setColor(0x000000)
                 .setThumbnail(message.author.displayAvatarURL())
                 .setFooter({ text: 'Monitoring in progress', iconURL: client.user.displayAvatarURL() })
@@ -276,36 +314,64 @@ client.on('messageCreate', async (message) => {
             await message.channel.send({ embeds: [embed] });
             watchedAccounts[username] = true;
             banWatchList.push(username);
+            
             const intv = setInterval(async function() {
-                const infoa = await check(username)
-                if (infoa.length == 3) {
-                    const currentTime = Date.now()
+                const infoa = await check(username);
+                
+                if (infoa === 'BLOCKED') {
+                    console.log(`Monitoring ${username} - requests blocked, will retry...`);
+                    return;
+                }
+                
+                if (isBanned(infoa)) {
+                    const currentTime = Date.now();
                     const timeDifference = Math.abs(currentTime - startTime) / 1000;
                     const timeDifferenceMinutes = Math.floor(timeDifference / 60);
+                    
                     const embed = new EmbedBuilder()
                         .setTitle(`Account Has Been Smoked! | ${username} ✅`)
-                        .setDescription(`Time Taken: ${timeDifferenceMinutes} minutes ${info}`)
-                        .setColor(0x000000)
+                        .setDescription(`Time Taken: ${timeDifferenceMinutes} minutes`)
+                        .setColor(0xFF0000)
                         .setFooter({ text: 'Monitor Bot v1', iconURL: client.user.displayAvatarURL() });
+                    
+                    delete watchedAccounts[username];
                     const index = banWatchList.indexOf(username);
                     if (index > -1) {
                         banWatchList.splice(index, 1);
                     }
+                    
                     await message.channel.send({ embeds: [embed] });
-                    clearInterval(intv)
+                    clearInterval(intv);
                 }
-            }, CHECK_INTERVAL)
+            }, CHECK_INTERVAL);
         } else {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: `Requested by @${message.author.username} ${formatTimestamp(startTime)}` })
                 .setTitle('❌ Invalid for Ban Watch')
-                .setDescription(`The Instagram account **@${username}** is already banned and cannot be watched for bans.`)
+                .setDescription(`The Instagram account **@${username}** is already banned or unavailable and cannot be watched for bans.\n\nStatus: ${info}`)
                 .setColor(0xFF0000)
                 .setThumbnail(message.author.displayAvatarURL())
                 .setFooter({ text: 'Please try again', iconURL: client.user.displayAvatarURL() });
 
             await message.channel.send({ embeds: [embed] });
         }
+    } else if (message.content.startsWith('!check')) {
+        const args = message.content.split(' ');
+        if (args.length < 2) {
+            await message.channel.send('Usage: !check <username>');
+            return;
+        }
+        
+        const username = args[1].replace('@', '');
+        const info = await check(username);
+        
+        const embed = new EmbedBuilder()
+            .setTitle(`Account Status: @${username}`)
+            .setDescription(`Status: ${info}`)
+            .setColor(0x0099FF)
+            .setFooter({ text: 'Account check', iconURL: client.user.displayAvatarURL() });
+
+        await message.channel.send({ embeds: [embed] });
     } else if (message.content.startsWith('!banlist')) {
         if (banWatchList.length === 0) {
             const embed = new EmbedBuilder()
@@ -348,6 +414,7 @@ client.on('messageCreate', async (message) => {
             .setDescription(`
             **!banwatch <username>** - Starts monitoring an Instagram account for being banned.
             **!unbanwatch <username>** - Starts monitoring an Instagram account for being unbanned.
+            **!check <username>** - Check the current status of an Instagram account.
             **!banlist** - Displays a list of all accounts currently being monitored for bans.
             **!unbanlist** - Displays a list of all accounts currently being monitored for unbans.
             **!giveaccess <user id>** - Grants access to a user by adding them to the allowed list.
@@ -358,34 +425,7 @@ client.on('messageCreate', async (message) => {
             .setFooter({ text: 'Requested by ' + message.author.username, iconURL: client.user.displayAvatarURL() });
 
         await message.channel.send({ embeds: [embed] });
-    }else if (message.content.startsWith('!fake')) {
-        const embed = new EmbedBuilder()
-            .setColor('#000000')
-            .setTitle('Account has been smoked! ✅ | example_username')
-            .setDescription(`Time Taken: 0hr 2m 53s | Followers: 65`)
-            .setFooter({ text: 'Monitor Bot v1' })
-            .setTimestamp();
-
-        message.channel.send({ embeds: [embed] });
     }
 });
-
-async function sendErrorDM(userId, errorMessage) {
-    try {
-        const user = await client.users.fetch(userId);
-        const embed = new EmbedBuilder()
-            .setAuthor({ name: `Requested by @${user.username} ${formatTimestamp(new Date())}` })
-            .setTitle('❌ Error')
-            .setDescription(`An error occurred: **${errorMessage}**`)
-            .setColor(0xFF0000)
-            .setFooter({ text: 'Please try again later', iconURL: client.user.displayAvatarURL() })
-            .setImage('https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExazhxZGV5bWwyb2NmZzdkOTJnanpieHJ4eXkzZWRkaHV6bzgzZmlrMCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/qfEc3uhiSjKLu/giphy.gif');
-
-        await user.send({ embeds: [embed] });
-    } catch (dmError) {
-        console.error('Failed to send error DM:', dmError);
-    }
-}
-
 
 client.login(TOKEN);
