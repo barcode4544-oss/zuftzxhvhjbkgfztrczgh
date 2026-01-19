@@ -18,7 +18,11 @@ async function initBrowser() {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
+                '--disable-blink-features=AutomationControlled',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--ignore-certificate-errors',
+                '--ignore-certificate-errors-spki-list'
             ]
         });
         
@@ -26,7 +30,9 @@ async function initBrowser() {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport: { width: 1920, height: 1080 },
             locale: 'en-US',
-            timezoneId: 'America/New_York'
+            timezoneId: 'America/New_York',
+            ignoreHTTPSErrors: true, // Ignore SSL errors
+            bypassCSP: true // Bypass Content Security Policy
         });
         
         console.log('Browser initialized successfully');
@@ -50,11 +56,18 @@ async function check(username) {
         const url = `https://www.instagram.com/${username}/`;
         console.log(`\n=== Checking: ${url} ===`);
         
-        // Navigate to the profile with timeout
-        const response = await page.goto(url, { 
-            waitUntil: 'networkidle',
-            timeout: 30000 
-        });
+        // Navigate to the profile with more lenient settings
+        let response;
+        try {
+            response = await page.goto(url, { 
+                waitUntil: 'domcontentloaded', // Changed from networkidle to be more lenient
+                timeout: 30000 
+            });
+        } catch (gotoError) {
+            // If goto fails, try to still analyze the page
+            console.log(`⚠️ Navigation warning: ${gotoError.message}`);
+            // Continue anyway, the page might have loaded partially
+        }
         
         // Wait a bit more for dynamic content to load
         await page.waitForTimeout(3000);
@@ -150,11 +163,20 @@ async function check(username) {
             return 'ACTIVE';
         }
         
-        // Method 6: Check if response was successful
-        if (response && response.ok() && response.status() === 200) {
-            console.log(`✅ Page loaded successfully (200 OK) - account likely exists`);
-            await page.close();
-            return 'ACTIVE';
+        // Method 6: Check if response was successful (if we got a response)
+        if (response) {
+            console.log(`Response status: ${response.status()}`);
+            if (response.ok() && response.status() === 200) {
+                console.log(`✅ Page loaded successfully (200 OK) - account likely exists`);
+                await page.close();
+                return 'ACTIVE';
+            }
+            // Handle specific status codes
+            if (response.status() === 404) {
+                console.log(`❌ 404 Not Found - account doesn't exist or is banned`);
+                await page.close();
+                return 'BANNED';
+            }
         }
         
         console.log(`⚠️ Could not determine account status definitively`);
@@ -163,7 +185,34 @@ async function check(username) {
         
     } catch (error) {
         console.error(`❌ Error checking ${username}:`, error.message);
-        if (page) await page.close().catch(() => {});
+        if (page) {
+            try {
+                // Try to check if page loaded despite error
+                const currentUrl = await page.url().catch(() => null);
+                if (currentUrl && !currentUrl.includes('/accounts/login')) {
+                    console.log(`⚠️ Error occurred but page might have loaded, attempting to analyze...`);
+                    
+                    // Try to check for error message
+                    const pageNotAvailable = await page.locator('text=/Sorry, this page isn.*t available/i').count().catch(() => 0);
+                    if (pageNotAvailable > 0) {
+                        console.log(`❌ Account is banned despite navigation error`);
+                        await page.close();
+                        return 'BANNED';
+                    }
+                    
+                    // Try to find any sign of account
+                    const bodyText = await page.locator('body').textContent().catch(() => '');
+                    if (bodyText.includes('followers') || bodyText.includes('posts')) {
+                        console.log(`✅ Account appears active despite navigation error`);
+                        await page.close();
+                        return 'ACTIVE';
+                    }
+                }
+            } catch (analysisError) {
+                console.log(`Could not analyze page after error: ${analysisError.message}`);
+            }
+            await page.close().catch(() => {});
+        }
         return 'ERROR';
     }
 }
