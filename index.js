@@ -1,5 +1,4 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
-const { igLogin, check } = require('./ig'); 
 require('dotenv').config();
 
 var bancache = {};
