@@ -194,7 +194,7 @@ client.on('messageCreate', async (message) => {
                 .setColor(0x000000)
                 .setThumbnail(message.author.displayAvatarURL())
                 .setFooter({ text: 'Monitoring in progress', iconURL: client.user.displayAvatarURL() })
-                .setImage('https://media.giphy.com/media/niNTPEoAhOSli/giphy.gif');
+                .setImage('https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExazhxZGV5bWwyb2NmZzdkOTJnanpieHJ4eXkzZWRkaHV6bzgzZmlrMCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/qfEc3uhiSjKLu/giphy.gif');
 
             await message.channel.send({ embeds: [embed] });
             unbancache[username] = info;
