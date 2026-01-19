@@ -1,92 +1,156 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { chromium } = require('playwright');
 require('dotenv').config();
 
 var bancache = {};
 var unbancache = {};
 
-// Improved check function with better error handling and rate limiting
-async function check(username) {
-    try {
-        // Add random delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, Math.random() * 2000 + 1000));
-        
-        const req = await fetch(`https://www.instagram.com/${username}/`, {
-            "headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Cache-Control": "max-age=0",
-                "DNT": "1"
-            },
-            "method": "GET",
-            "redirect": "manual" // Don't follow redirects
+// Browser instance that will be reused
+let browser = null;
+let browserContext = null;
+
+// Initialize browser
+async function initBrowser() {
+    if (!browser) {
+        browser = await chromium.launch({
+            headless: true, // Set to false for debugging
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+            ]
         });
-
-        // Check if we got redirected to login (status 301/302)
-        if (req.status === 301 || req.status === 302) {
-            console.log(`Redirected - Instagram may be blocking requests for ${username}`);
-            return 'BLOCKED'; // Return special status
-        }
-
-        if (req.status !== 200) {
-            console.log(`Status ${req.status} for ${username}`);
-            return 'ERROR';
-        }
-
-        const res = await req.text();
         
-        // Check if we're on the login page
-        if (res.includes('Login • Instagram') || res.includes('accounts/login')) {
-            console.log(`Login page detected for ${username} - requests are being blocked`);
+        browserContext = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport: { width: 1920, height: 1080 },
+            locale: 'en-US',
+            timezoneId: 'America/New_York'
+        });
+        
+        console.log('Browser initialized successfully');
+    }
+    return browserContext;
+}
+
+// Improved check function using Playwright
+async function check(username) {
+    let page = null;
+    try {
+        const context = await initBrowser();
+        page = await context.newPage();
+        
+        // Set extra headers to appear more human-like
+        await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        });
+        
+        const url = `https://www.instagram.com/${username}/`;
+        console.log(`Checking: ${url}`);
+        
+        // Navigate to the profile with timeout
+        const response = await page.goto(url, { 
+            waitUntil: 'domcontentloaded',
+            timeout: 30000 
+        });
+        
+        // Wait a bit for dynamic content to load
+        await page.waitForTimeout(2000);
+        
+        // Check if we're on login page
+        const currentUrl = page.url();
+        if (currentUrl.includes('/accounts/login')) {
+            console.log(`Redirected to login for ${username}`);
+            await page.close();
             return 'BLOCKED';
         }
-
-        // Multiple ways to check account status
-        // Method 1: Check for specific error messages
-        if (res.includes('Sorry, this page') || res.includes('isn\'t available')) {
-            return 'N/A'; // Banned or doesn't exist
+        
+        // Get page content
+        const content = await page.content();
+        
+        // Method 1: Check for "Sorry, this page isn't available" message
+        const pageNotAvailable = await page.locator('text=Sorry, this page isn\'t available').count();
+        if (pageNotAvailable > 0) {
+            console.log(`Account ${username} is not available (banned or doesn't exist)`);
+            await page.close();
+            return 'N/A';
         }
-
-        // Method 2: Try to find follower data
-        const sp = res.split('<meta property="og:description" content="');
-        if (sp.length > 1) {
-            const description = sp[1].split('"')[0];
-            const followerMatch = description.match(/(\d+[\d,]*)\s+Followers?/i);
+        
+        // Method 2: Try to find follower count from meta tags
+        const metaContent = await page.locator('meta[property="og:description"]').getAttribute('content');
+        if (metaContent) {
+            console.log(`Meta description: ${metaContent}`);
+            
+            // Extract follower count
+            const followerMatch = metaContent.match(/(\d+[\d,]*)\s+Followers?/i);
             if (followerMatch) {
-                return followerMatch[1].replace(/,/g, '');
+                const followers = followerMatch[1].replace(/,/g, '');
+                console.log(`Found ${followers} followers for ${username}`);
+                await page.close();
+                return followers;
             }
-            return description.split('-')[0].trim();
+            
+            // If no followers found, try to extract first part before dash
+            const parts = metaContent.split('-');
+            if (parts.length > 0) {
+                await page.close();
+                return parts[0].trim();
+            }
         }
-
-        // Method 3: Check JSON data in page
-        const jsonMatch = res.match(/<script type="application\/ld\+json">(.*?)<\/script>/s);
-        if (jsonMatch) {
+        
+        // Method 3: Try to find follower count from page elements
+        try {
+            // Wait for profile data to load
+            await page.waitForSelector('header', { timeout: 5000 });
+            
+            // Try to find follower text
+            const followerElement = await page.locator('a[href*="/followers/"] span').first().textContent();
+            if (followerElement) {
+                console.log(`Found follower count from element: ${followerElement}`);
+                await page.close();
+                return followerElement.replace(/,/g, '');
+            }
+        } catch (e) {
+            console.log(`Could not find follower element: ${e.message}`);
+        }
+        
+        // Method 4: Check JSON-LD data
+        const jsonLdScript = await page.locator('script[type="application/ld+json"]').first().textContent().catch(() => null);
+        if (jsonLdScript) {
             try {
-                const data = JSON.parse(jsonMatch[1]);
+                const data = JSON.parse(jsonLdScript);
                 if (data && data.mainEntityofPage) {
-                    return 'ACTIVE'; // Account exists and is accessible
+                    console.log(`Account ${username} is active (from JSON-LD)`);
+                    await page.close();
+                    return 'ACTIVE';
                 }
             } catch (e) {
-                // JSON parsing failed, continue
+                // JSON parsing failed
             }
         }
-
+        
+        // If we got here and the page loaded successfully, account likely exists
+        if (response && response.ok()) {
+            console.log(`Account ${username} appears to be active`);
+            await page.close();
+            return 'ACTIVE';
+        }
+        
+        await page.close();
         return 'N/A';
+        
     } catch (error) {
         console.error(`Error checking ${username}:`, error.message);
+        if (page) await page.close().catch(() => {});
         return 'ERROR';
     }
 }
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
-const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 120000;
+const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 180000; // Increased to 3 minutes
 
 let watchedAccounts = {}; 
 let storedFollowerData = {};  
@@ -104,9 +168,10 @@ const client = new Client({
     ],
 });
 
-// Fix the deprecation warning
-client.once('clientReady', () => {
+client.once('clientReady', async () => {
     console.log(`We have logged in as ${client.user.tag}`);
+    console.log('Initializing browser...');
+    await initBrowser();
     console.log('Bot is ready to monitor Instagram accounts!');
 });
 
@@ -115,7 +180,7 @@ function formatTimestamp(date) {
 }
 
 function isBanned(info) {
-    return info === 'N/A' || (typeof info === 'string' && info.length <= 3);
+    return info === 'N/A' || (typeof info === 'string' && info.length <= 3 && info !== 'N/A');
 }
 
 function isActive(info) {
@@ -193,17 +258,26 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        const username = args[1].replace('@', ''); // Remove @ if present
+        const username = args[1].replace('@', '');
         const startTime = new Date();
 
+        // Show loading message
+        const loadingEmbed = new EmbedBuilder()
+            .setTitle('🔍 Checking Account Status...')
+            .setDescription(`Checking **@${username}**...`)
+            .setColor(0x0099FF);
+        const loadingMsg = await message.channel.send({ embeds: [loadingEmbed] });
+
         const info = await check(username);
+
+        await loadingMsg.delete().catch(() => {});
 
         if (info === 'BLOCKED') {
             const embed = new EmbedBuilder()
                 .setTitle('⚠️ Request Blocked')
-                .setDescription(`Instagram is blocking automated requests. The bot may need to use proxies or reduce request frequency.`)
+                .setDescription(`Instagram is blocking automated requests. Try again in a few minutes.`)
                 .setColor(0xFFA500)
-                .setFooter({ text: 'Try again later', iconURL: client.user.displayAvatarURL() });
+                .setFooter({ text: 'Rate limited', iconURL: client.user.displayAvatarURL() });
 
             await message.channel.send({ embeds: [embed] });
             return;
@@ -288,14 +362,23 @@ client.on('messageCreate', async (message) => {
         const username = args[1].replace('@', '');
         const startTime = new Date();
 
+        // Show loading message
+        const loadingEmbed = new EmbedBuilder()
+            .setTitle('🔍 Checking Account Status...')
+            .setDescription(`Checking **@${username}**...`)
+            .setColor(0x0099FF);
+        const loadingMsg = await message.channel.send({ embeds: [loadingEmbed] });
+
         const info = await check(username);
+
+        await loadingMsg.delete().catch(() => {});
 
         if (info === 'BLOCKED') {
             const embed = new EmbedBuilder()
                 .setTitle('⚠️ Request Blocked')
-                .setDescription(`Instagram is blocking automated requests. The bot may need to use proxies or reduce request frequency.`)
+                .setDescription(`Instagram is blocking automated requests. Try again in a few minutes.`)
                 .setColor(0xFFA500)
-                .setFooter({ text: 'Try again later', iconURL: client.user.displayAvatarURL() });
+                .setFooter({ text: 'Rate limited', iconURL: client.user.displayAvatarURL() });
 
             await message.channel.send({ embeds: [embed] });
             return;
@@ -363,12 +446,41 @@ client.on('messageCreate', async (message) => {
         }
         
         const username = args[1].replace('@', '');
+        
+        const loadingEmbed = new EmbedBuilder()
+            .setTitle('🔍 Checking Account...')
+            .setDescription(`Checking **@${username}**...`)
+            .setColor(0x0099FF);
+        const loadingMsg = await message.channel.send({ embeds: [loadingEmbed] });
+        
         const info = await check(username);
+        
+        await loadingMsg.delete().catch(() => {});
+        
+        let statusColor = 0x0099FF;
+        let statusText = info;
+        
+        if (info === 'N/A') {
+            statusColor = 0xFF0000;
+            statusText = 'Banned or Not Found';
+        } else if (info === 'BLOCKED') {
+            statusColor = 0xFFA500;
+            statusText = 'Request Blocked (Rate Limited)';
+        } else if (info === 'ERROR') {
+            statusColor = 0xFF0000;
+            statusText = 'Error Occurred';
+        } else if (info === 'ACTIVE') {
+            statusColor = 0x00FF00;
+            statusText = 'Active (No follower count available)';
+        } else if (!isNaN(info)) {
+            statusColor = 0x00FF00;
+            statusText = `Active - ${info} followers`;
+        }
         
         const embed = new EmbedBuilder()
             .setTitle(`Account Status: @${username}`)
-            .setDescription(`Status: ${info}`)
-            .setColor(0x0099FF)
+            .setDescription(`Status: ${statusText}`)
+            .setColor(statusColor)
             .setFooter({ text: 'Account check', iconURL: client.user.displayAvatarURL() });
 
         await message.channel.send({ embeds: [embed] });
@@ -419,6 +531,8 @@ client.on('messageCreate', async (message) => {
             **!unbanlist** - Displays a list of all accounts currently being monitored for unbans.
             **!giveaccess <user id>** - Grants access to a user by adding them to the allowed list.
             **!help** - Displays this help message.
+            
+            **Note:** Using Playwright for better reliability. Check interval is 3 minutes.
             `)
             .setColor(0x000000)
             .setThumbnail('https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExOWtxcTZpa2gyMHE1cDFteWNod2Jjbmt0bmJjamNoYXo3MHB1Mjd0ZiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/OUy615BJPyrkAxkwTh/giphy.gif')
@@ -426,6 +540,23 @@ client.on('messageCreate', async (message) => {
 
         await message.channel.send({ embeds: [embed] });
     }
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    console.log('Shutting down gracefully...');
+    if (browser) {
+        await browser.close();
+    }
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('Shutting down gracefully...');
+    if (browser) {
+        await browser.close();
+    }
+    process.exit(0);
 });
 
 client.login(TOKEN);
